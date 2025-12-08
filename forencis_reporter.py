@@ -1,221 +1,460 @@
-import os
-import sys
+# python forensics_reporter.py --pdf sample.pdf --images images_dir --out report.docx
+
+import argparse
+import io
+import csv
 import hashlib
 import zipfile
 import tempfile
 import datetime
+import os
+import sys
+import logging
 from pathlib import Path
-from docx import Document
-from docx.shared import Inches
-import fitz  # PyMuPDF
+from typing import Dict, Optional, Set
 
-# ANSI escape codes for color
+from docx import Document
+from docx.shared import Inches, Pt
+import fitz  # PyMuPDF
+from PIL import Image, ExifTags
+
+# ANSI colors
 RED = "\033[91m"
-GREEN = "\033[92m"
 YELLOW = "\033[93m"
-BLUE = "\033[94m"
 MAGENTA = "\033[95m"
 CYAN = "\033[96m"
-WHITE = "\033[97m"
 RESET = "\033[0m"
 
 print(f'''
 {RED}      
-                                                                                                                                               
-@@@@@@@@  @@@@@@  @@@@@@@  @@@@@@@@ @@@  @@@  @@@@@@ @@@  @@@@@@@       @@@@@@@  @@@@@@@@ @@@@@@@   @@@@@@  @@@@@@@  @@@@@@@ @@@@@@@@ @@@@@@@  
-@@!      @@!  @@@ @@!  @@@ @@!      @@!@!@@@ !@@     @@! !@@            @@!  @@@ @@!      @@!  @@@ @@!  @@@ @@!  @@@   @!!   @@!      @@!  @@@ 
-@!!!:!   @!@  !@! @!@!!@!  @!!!:!   @!@@!!@!  !@@!!  !!@ !@!            @!@!!@!  @!!!:!   @!@@!@!  @!@  !@! @!@!!@!    @!!   @!!!:!   @!@!!@!  
-!!:      !!:  !!! !!: :!!  !!:      !!:  !!!     !:! !!: :!!            !!: :!!  !!:      !!:      !!:  !!! !!: :!!    !!:   !!:      !!: :!!  
- :        : :. :   :   : : : :: ::  ::    :  ::.: :  :    :: :: :        :   : : : :: ::   :        : :. :   :   : :    :    : :: ::   :   : : 
-                                                                                                                                               
-{YELLOW}|-----------------------------------------------------{MAGENTA}Coded by Mishima and Nocturnis{YELLOW}----------------------------------------------------------------|{RESET}''')
+                                                                                                                  
+ ,---.                                    ,--.                                               ,--.                 
+/  .-' ,---. ,--.--. ,---. ,--,--,  ,---. `--' ,---.    ,--.--. ,---.  ,---.  ,---. ,--.--.,-'  '-. ,---. ,--.--. 
+|  `-,| .-. ||  .--'| .-. :|      \(  .-' ,--.| .--'    |  .--'| .-. :| .-. || .-. ||  .--''-.  .-'| .-. :|  .--' 
+|  .-'' '-' '|  |   \   --.|  ||  |.-'  `)|  |\ `--.    |  |   \   --.| '-' '' '-' '|  |     |  |  \   --.|  |    
+`--'   `---' `--'    `----'`--''--'`----' `--' `---'    `--'    `----'|  |-'  `---' `--'     `--'   `----'`--'    
+                                                                      `--'                                        
+{YELLOW}|-------------------------------------------------{MAGENTA}coded by Mishima and Nocturnis){YELLOW}------------------------------------------------------------|{RESET}
+{CYAN}[+] • DOCX + CSV output •{RESET}
+''')
 
-# ------------------ Helpers ------------------
+# -------------------- Config --------------------
+SUPPORTED_EXT = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp'}
+MAX_EMBED_PIXELS = 2500 * 2500  # avoid embedding absurdly huge images
+EMBED_WIDTH_INCH = 2.8
+CSV_ENCODING = 'utf-8-sig'
+CSV_QUOTE = csv.QUOTE_ALL
+EXIF_TAGS = {v: k for k, v in ExifTags.TAGS.items()}
 
+# -------------------- Logging --------------------
+logger = logging.getLogger("forensics_reporter")
+handler = logging.StreamHandler()
+formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', '%Y-%m-%d %H:%M:%S')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+
+# -------------------- Utilities --------------------
 def sha256_data(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
-def sha256_file(filepath: str) -> str:
-    hash_sha256 = hashlib.sha256()
-    with open(filepath, "rb") as f:
-        for chunk in iter(lambda: f.read(4096), b""):
-            hash_sha256.update(chunk)
-    return hash_sha256.hexdigest()
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            h.update(chunk)
+    return h.hexdigest()
 
 def format_ts(ts: float) -> str:
     return datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
 
-def add_image_to_doc(doc: Document, image_path_or_bytes, metadata: dict):
-    """Add image + metadata table to doc."""
-    is_bytes = isinstance(image_path_or_bytes, bytes)
-    ext = metadata.get("ext", "jpg")
-    
-    # Handle bytes by writing to temp file
-    temp_path = None
-    if is_bytes:
-        # Use hash to avoid collisions
-        hash_prefix = hashlib.md5(image_path_or_bytes).hexdigest()[:8]
-        temp_path = f"temp_img_{hash_prefix}.{ext}"
-        with open(temp_path, "wb") as f:
-            f.write(image_path_or_bytes)
-        display_path = temp_path
-    else:
-        display_path = image_path_or_bytes
-
-    # Create table: image | metadata
-    table = doc.add_table(rows=1, cols=2)
-    table.style = 'Table Grid'
-
-    # Embed image
+def safe_str(v) -> str:
+    if v is None:
+        return ''
     try:
-        paragraph = table.cell(0, 0).paragraphs[0]
-        run = paragraph.add_run()
-        run.add_picture(display_path, width=Inches(3))
+        return str(v).replace('\x00', '').strip()
+    except Exception:
+        return ''
+
+# -------------------- EXIF helpers --------------------
+def get_exif_pillow_bytes(image_bytes: bytes) -> Dict[str, str]:
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            exif = img.getexif()
+            if not exif:
+                return {}
+            out = {}
+            for k, v in exif.items():
+                name = ExifTags.TAGS.get(k, k)
+                out[name] = safe_str(v)
+            return out
     except Exception as e:
-        table.cell(0, 0).text = f"[Embed failed: {str(e)[:100]}]"
+        logger.debug(f"get_exif_pillow_bytes failed: {e}")
+        return {}
 
-    # Build metadata string
-    meta_text = f"SHA-256: {metadata['hash']}\n"
-    if 'size' in metadata:
-        meta_text += f"Size: {metadata['size']} bytes\n"
-    if 'modified' in metadata:
-        meta_text += f"Modified: {metadata['modified']}\n"
-    if 'created' in metadata:
-        meta_text += f"Created*: {metadata['created']}\n"
-    meta_text += f"Source: {metadata['source']}"
+def get_exif_pillow_path(path: str) -> Dict[str, str]:
+    try:
+        with Image.open(path) as img:
+            exif = img.getexif()
+            if not exif:
+                return {}
+            out = {}
+            for k, v in exif.items():
+                name = ExifTags.TAGS.get(k, k)
+                out[name] = safe_str(v)
+            return out
+    except Exception as e:
+        logger.debug(f"get_exif_pillow_path failed for {path}: {e}")
+        return {}
 
-    table.cell(0, 1).text = meta_text
+# -------------------- Safe ZIP extraction --------------------
+def safe_extract_zip(zf: zipfile.ZipFile, dest: str, members: Optional[list] = None) -> list:
+    extracted = []
+    dest = os.path.abspath(dest)
+    names = members or zf.namelist()
+    for name in names:
+        if name.endswith('/') or name.startswith('__MACOSX'):
+            continue
+        normalized = os.path.normpath(name)
+        if os.path.isabs(normalized) or normalized.startswith('..'):
+            logger.warning(f"Skipping suspicious zip member (path traversal): {name}")
+            continue
+        ext = Path(normalized).suffix.lower()
+        if ext not in SUPPORTED_EXT:
+            continue
+        target_path = os.path.join(dest, normalized)
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        with zf.open(name) as src, open(target_path, 'wb') as dst:
+            dst.write(src.read())
+        extracted.append(target_path)
+    return extracted
 
-    # Add warning if needed
-    if metadata.get("warning"):
-        table.cell(0, 1).add_paragraph(f"\n{metadata['warning']}")
+# -------------------- Image compression --------------------
+def fix_orientation(img: Image.Image) -> Image.Image:
+    try:
+        exif = img._getexif()
+        if exif is None:
+            return img
+        orientation_key = next((k for k, v in ExifTags.TAGS.items() if v == 'Orientation'), None)
+        if not orientation_key:
+            return img
+        orientation = exif.get(orientation_key)
+        if orientation == 3:
+            img = img.rotate(180, expand=True)
+        elif orientation == 6:
+            img = img.rotate(270, expand=True)
+        elif orientation == 8:
+            img = img.rotate(90, expand=True)
+        return img
+    except Exception:
+        return img
 
-    doc.add_paragraph()  # spacing
+def compress_image_bytes_for_docx(img_bytes: bytes, ext: str) -> bytes:
+    try:
+        with Image.open(io.BytesIO(img_bytes)) as img:
+            # EXIF Orientation fix
+            img = fix_orientation(img)
 
-    # Cleanup temp file
-    if temp_path and os.path.exists(temp_path):
-        os.remove(temp_path)
+            # Resize big images
+            w, h = img.size
+            pixels = w * h
+            if pixels > MAX_EMBED_PIXELS:
+                scale = (MAX_EMBED_PIXELS / pixels) ** 0.5
+                new_w = max(100, int(w * scale))
+                new_h = max(100, int(h * scale))
+                img = img.resize((new_w, new_h), Image.LANCZOS)
 
-# ------------------ Process PDF ------------------
+            # RGBA/LA → RGB conversion
+            if img.mode in ("RGBA", "LA"):
+                bg = Image.new("RGB", img.size, (255, 255, 255))
+                bg.paste(img, mask=img.split()[-1])
+                img = bg
 
-def process_pdf(pdf_path: str, doc: Document):
+            # JPEG compress
+            bio = io.BytesIO()
+            img.save(bio, format='JPEG', quality=75, optimize=True)
+            return bio.getvalue()
+    except Exception as e:
+        logger.debug(f"compress_image_bytes_for_docx failed: {e}")
+        return img_bytes
+
+
+# -------------------- DOCX helpers --------------------
+def style_doc(doc: Document):
+    try:
+        style = doc.styles['Normal']
+        font = style.font
+        font.name = 'Consolas'
+        font.size = Pt(9)
+    except Exception:
+        pass
+
+def add_chain_of_custody(doc: Document):
+    doc.add_heading('Chain of Custody', level=2)
+    now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    p = doc.add_paragraph()
+    p.add_run(f"Generated: {now}\n")
+    p.add_run("Notes: Report generated by forensics_reporter.py")
+    doc.add_paragraph('\n')
+
+def add_image_table(doc: Document, image_bytes: bytes, metadata: Dict[str, str]):
+    emb_bytes = compress_image_bytes_for_docx(image_bytes, metadata.get('ext', 'jpg'))
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp:
+        tmp.write(emb_bytes)
+        tmp_path = tmp.name
+    try:
+        table = doc.add_table(rows=1, cols=2)
+        table.style = 'Table Grid'
+        cell_img = table.cell(0, 0)
+        paragraph = cell_img.paragraphs[0]
+        run = paragraph.add_run()
+        try:
+            run.add_picture(tmp_path, width=Inches(EMBED_WIDTH_INCH))
+        except Exception as e:
+            cell_img.text = f"[Embed failed: {e}]"
+
+        cell_meta = table.cell(0, 1)
+        meta_lines = [f"SHA-256: {metadata.get('hash','')}"]
+        if 'size' in metadata:
+            meta_lines.append(f"Size: {metadata.get('size')} bytes")
+        if 'modified' in metadata:
+            meta_lines.append(f"Modified: {metadata.get('modified')}")
+        if 'created' in metadata:
+            meta_lines.append(f"Created*: {metadata.get('created')}")
+        meta_lines.append(f"Source: {metadata.get('source','')}")
+
+        if metadata.get('exif_summary'):
+            meta_lines.append('\nEXIF:')
+            meta_lines.extend(metadata['exif_summary'].split('\n'))
+
+        cell_meta.text = '\n'.join(meta_lines)
+        doc.add_paragraph()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+# -------------------- CSV helpers --------------------
+def write_csv_header(csv_path: str):
+    with open(csv_path, 'w', newline='', encoding=CSV_ENCODING) as f:
+        writer = csv.writer(f, quoting=CSV_QUOTE)
+        writer.writerow([
+            'sha256', 'source', 'size_bytes', 'modified', 'created',
+            'make', 'model', 'software', 'datetime_original'
+        ])
+
+def append_to_csv(csv_path: str, record: Dict[str, str]):
+    with open(csv_path, 'a', newline='', encoding=CSV_ENCODING) as f:
+        writer = csv.writer(f, quoting=CSV_QUOTE)
+        writer.writerow([
+            record.get('sha256',''),
+            record.get('source',''),
+            record.get('size_bytes',''),
+            record.get('modified',''),
+            record.get('created',''),
+            record.get('make',''),
+            record.get('model',''),
+            record.get('software',''),
+            record.get('datetime_original','')
+        ])
+
+# -------------------- Processing functions --------------------
+def process_pdf(pdf_path: str, doc: Document, csv_path: str, seen_hashes: Set[str]):
     if not os.path.isfile(pdf_path):
         doc.add_paragraph(f"[!] PDF not found: {pdf_path}")
         return
-
-    doc.add_heading("Source: Embedded Images from PDF", level=1)
+    doc.add_heading('Source: Embedded Images from PDF', level=1)
     pdf_stat = os.stat(pdf_path)
-    doc.add_paragraph(
-        f"PDF Path: {os.path.abspath(pdf_path)}\n"
-        f"PDF Modified: {format_ts(pdf_stat.st_mtime)}\n"
-        f"Note: Embedded images have no original filesystem timestamps.\n"
-    )
+    doc.add_paragraph(f"PDF Path: {os.path.abspath(pdf_path)}\nPDF Modified: {format_ts(pdf_stat.st_mtime)}\n")
 
-    pdf_doc = fitz.open(pdf_path)
+    try:
+        pdf_doc = fitz.open(pdf_path)
+    except Exception as e:
+        logger.error(f"Failed to open PDF {pdf_path}: {e}")
+        return
+
     count = 0
-    for page_num, page in enumerate(pdf_doc):
-        for img_idx, img in enumerate(page.get_images(full=True)):
-            count += 1
-            xref = img[0]
-            base_img = pdf_doc.extract_image(xref)
-            img_bytes = base_img["image"]
-            ext = base_img["ext"] or "jpg"
+    try:
+        for page_num in range(len(pdf_doc)):
+            page = pdf_doc[page_num]
+            for img_idx, img in enumerate(page.get_images(full=True)):
+                try:
+                    xref = img[0]
+                    base_img = pdf_doc.extract_image(xref)
+                    img_bytes = base_img.get('image')
+                    ext = base_img.get('ext') or 'jpg'
+                    if not img_bytes:
+                        continue
+                    img_hash = sha256_data(img_bytes)
+                    if img_hash in seen_hashes:
+                        continue
+                    seen_hashes.add(img_hash)
+                    count += 1
 
-            img_hash = sha256_data(img_bytes)
+                    exif = get_exif_pillow_bytes(img_bytes)
+                    exif_keys = ['Make','Model','Software','DateTime','DateTimeOriginal']
+                    exif_summary = '\n'.join(f"{k}: {exif.get(k,'')}" for k in exif_keys if exif.get(k))
+                    if not exif_summary:
+                        exif_summary = 'No EXIF data.'
 
-            metadata = {
-                "hash": img_hash,
-                "ext": ext,
-                "size": len(img_bytes),
-                "source": f"PDF Page {page_num + 1}, Image {img_idx + 1}"
-            }
+                    metadata = {
+                        'hash': img_hash,
+                        'ext': ext,
+                        'size': len(img_bytes),
+                        'source': f"PDF Page {page_num+1}, Image {img_idx+1}",
+                        'exif_summary': exif_summary
+                    }
 
-            add_image_to_doc(doc, img_bytes, metadata)
+                    add_image_table(doc, img_bytes, metadata)
 
-    pdf_doc.close()
-    doc.add_paragraph(f"Extracted {count} images from PDF.\n")
+                    record = {
+                        'sha256': img_hash,
+                        'source': metadata['source'],
+                        'size_bytes': len(img_bytes),
+                        'modified': '',
+                        'created': '',
+                        'make': safe_str(exif.get('Make')),
+                        'model': safe_str(exif.get('Model')),
+                        'software': safe_str(exif.get('Software')),
+                        'datetime_original': safe_str(exif.get('DateTimeOriginal') or exif.get('DateTime'))
+                    }
+                    append_to_csv(csv_path, record)
+                except Exception as e:
+                    logger.warning(f"Failed to extract an image from PDF page {page_num+1}: {e}")
+    finally:
+        pdf_doc.close()
 
-# ------------------ Process Folder or ZIP ------------------
+    doc.add_paragraph(f"Extracted {count} unique images from PDF.\n")
 
-def process_image_files(input_path: str, doc: Document):
-    supported_ext = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp'}
-    warning = "(*'Created' may reflect inode change time on Linux, not true NTFS creation time.)"
+# -------------------- Image processing --------------------
+def process_single_image_file(img_path: str, doc: Document, csv_path: str, seen_hashes: Set[str], fs_warning: str, source_label: str = ''):
+    try:
+        img_hash = sha256_file(img_path)
+        if img_hash in seen_hashes:
+            return
+        seen_hashes.add(img_hash)
 
+        stat = os.stat(img_path)
+
+        exif = get_exif_pillow_path(img_path)
+        exif_time = exif.get('DateTimeOriginal') or exif.get('DateTime')
+        time_warning = ''
+        if exif_time:
+            try:
+                exif_dt = datetime.datetime.strptime(exif_time, '%Y:%m:%d %H:%M:%S')
+                file_dt = datetime.datetime.fromtimestamp(stat.st_mtime)
+                if abs((exif_dt - file_dt).total_seconds()) > 3600:
+                    time_warning = 'EXIF/file timestamp mismatch (>1h) – possible spoofing.'
+            except Exception:
+                pass
+
+        warning_full = (fs_warning + (' ' + time_warning if time_warning else '')).strip()
+
+        with open(img_path, 'rb') as f:
+            img_bytes = f.read()
+
+        exif_summary = '\n'.join(f"{k}: {exif.get(k,'')}" for k in ['Make','Model','Software','DateTime','DateTimeOriginal'] if exif.get(k))
+        if not exif_summary:
+            exif_summary = 'No EXIF data.'
+
+        metadata = {
+            'hash': img_hash,
+            'size': stat.st_size,
+            'modified': format_ts(stat.st_mtime),
+            'created': format_ts(stat.st_ctime),
+            'source': source_label if source_label else img_path,
+            'exif_summary': exif_summary,
+            'warning': warning_full
+        }
+
+        add_image_table(doc, img_bytes, metadata)
+
+        record = {
+            'sha256': img_hash,
+            'source': metadata['source'],
+            'size_bytes': stat.st_size,
+            'modified': format_ts(stat.st_mtime),
+            'created': format_ts(stat.st_ctime),
+            'make': safe_str(exif.get('Make')),
+            'model': safe_str(exif.get('Model')),
+            'software': safe_str(exif.get('Software')),
+            'datetime_original': safe_str(exif_time)
+        }
+        append_to_csv(csv_path, record)
+
+    except Exception as e:
+        logger.warning(f"Failed to process image {img_path}: {e}")
+
+def process_images_source(input_path: str, doc: Document, csv_path: str, seen_hashes: Set[str]):
+    fs_warning = "(*'Created' may reflect inode change time on Linux.)"
     if os.path.isdir(input_path):
-        doc.add_heading("Source: Recovered Image Files (Directory)", level=1)
-        image_files = sorted([f for f in Path(input_path).rglob('*') if f.suffix.lower() in supported_ext])
+        doc.add_heading('Source: Recovered Image Files (Directory)', level=1)
+        image_files = sorted([str(p) for p in Path(input_path).rglob('*') if p.suffix.lower() in SUPPORTED_EXT])
         for img in image_files:
-            process_single_image_file(str(img), doc, warning)
-
+            process_single_image_file(img, doc, csv_path, seen_hashes, fs_warning)
     elif zipfile.is_zipfile(input_path):
-        doc.add_heading("Source: Recovered Image Files (ZIP Archive)", level=1)
+        doc.add_heading('Source: Recovered Image Files (ZIP)', level=1)
         with tempfile.TemporaryDirectory() as tmp:
             with zipfile.ZipFile(input_path, 'r') as zf:
-                members = [m for m in zf.namelist() if Path(m).suffix.lower() in supported_ext and not m.endswith('/')]
-                zf.extractall(tmp, members=members)
-                for member in members:
-                    full_path = os.path.join(tmp, member)
-                    if os.path.isfile(full_path):
-                        source_label = f"{input_path} (member: {member})"
-                        process_single_image_file(full_path, doc, warning, source_label)
+                members = [m for m in zf.namelist() if Path(m).suffix.lower() in SUPPORTED_EXT and not m.endswith('/')]
+                extracted = safe_extract_zip(zf, tmp, members=members)
+                for full_path in extracted:
+                    source_label = f"{input_path} (member: {os.path.relpath(full_path, tmp)})"
+                    process_single_image_file(full_path, doc, csv_path, seen_hashes, fs_warning, source_label)
     else:
-        doc.add_paragraph(f"[!] Not a valid directory or ZIP: {input_path}")
+        doc.add_paragraph(f"[!] Not valid dir/ZIP: {input_path}")
 
-def process_single_image_file(img_path: str, doc: Document, warning: str = "", source_label: str = ""):
-    try:
-        stat = os.stat(img_path)
-        metadata = {
-            "hash": sha256_file(img_path),
-            "size": stat.st_size,
-            "modified": format_ts(stat.st_mtime),
-            "created": format_ts(stat.st_ctime),
-            "source": source_label if source_label else img_path,
-            "warning": warning
-        }
-        add_image_to_doc(doc, img_path, metadata)
-    except Exception as e:
-        doc.add_paragraph(f"[!] Failed to process {img_path}: {e}\n")
+# -------------------- Main --------------------
+def main(pdf_path: Optional[str], files_path: Optional[str], output_docx: str):
+    output_csv = str(Path(output_docx).with_suffix('.csv'))
 
-# ------------------ Main ------------------
-
-def main(pdf_path: str, file_source: str, output_docx: str):
     doc = Document()
-    doc.add_heading('Unified Digital Forensics Evidence Report', 0)
-    doc.add_paragraph(f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    style_doc(doc)
+    doc.add_heading('Forensics Evidence Report', 0)
+    gen_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    doc.add_paragraph(f"Generated: {gen_time}\n")
 
-    if pdf_path and os.path.isfile(pdf_path):
-        process_pdf(pdf_path, doc)
+    write_csv_header(output_csv)
+    seen_hashes: Set[str] = set()
+
+    if pdf_path:
+        process_pdf(pdf_path, doc, output_csv, seen_hashes)
     else:
-        doc.add_paragraph("No valid PDF provided.\n")
+        doc.add_paragraph('No valid PDF provided.\n')
 
-    if file_source and (os.path.isdir(file_source) or zipfile.is_zipfile(file_source)):
-        process_image_files(file_source, doc)
+    if files_path:
+        process_images_source(files_path, doc, output_csv, seen_hashes)
     else:
-        doc.add_paragraph("No valid image folder/ZIP provided.\n")
+        doc.add_paragraph('No valid image folder/ZIP provided.\n')
 
-    doc.save(output_docx)
-    print(f"[+] Report saved: {output_docx}")
+    add_chain_of_custody(doc)
 
-# ------------------ CLI ------------------
+    try:
+        doc.save(output_docx)
+        logger.info(f"Report saved: {output_docx}")
+        logger.info(f"Metadata CSV saved: {output_csv}")
+    except Exception as e:
+        logger.error(f"Failed to save report: {e}")
 
-if __name__ == "__main__":
-    if len(sys.argv) != 4:
-        print("Usage: python forencis_reporter.py <pdf_file_or_NONE> <image_folder_or_zip> <output.docx>")
-        print("Examples:")
-        print("  python forencis_reporter.py evidence.pdf recovered/ report.docx")
-        print("  python forencis_reporter.py NONE images.zip report.docx")
-        print("  python forencis_reporter.py scan.pdf NONE report.docx")
+# -------------------- CLI --------------------
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Forensics reporter - extract images from PDFs and image sources into DOCX+CSV')
+    parser.add_argument('--pdf', type=str, default=None, help='Path to PDF file (use None to skip)')
+    parser.add_argument('--images', type=str, default=None, help='Path to directory or ZIP with images (use None to skip)')
+    parser.add_argument('--out', type=str, required=True, help='Output DOCX path')
+
+    args = parser.parse_args()
+
+    if not args.pdf and not args.images:
+        logger.error('Provide at least --pdf or --images')
         sys.exit(1)
 
-    arg_pdf = sys.argv[1]
-    arg_files = sys.argv[2]
-    output = sys.argv[3]
-
-    pdf_path = None if arg_pdf.lower() == "none" else arg_pdf
-    file_source = None if arg_files.lower() == "none" else arg_files
-
-    if not pdf_path and not file_source:
-        print("[!] Error: Provide at least a PDF or image source.")
-        sys.exit(1)
-
-    main(pdf_path, file_source, output)
+    try:
+        main(args.pdf, args.images, args.out)
+    except KeyboardInterrupt:
+        logger.info('Interrupted by user')
+        sys.exit(2)
+    except Exception as e:
+        logger.exception(f"Unhandled exception: {e}")
+        sys.exit(3)
