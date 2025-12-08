@@ -439,7 +439,7 @@ def main(pdf_path: Optional[str], files_path: Optional[str], output_docx: str):
 
 # -------------------- CLI --------------------
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Forensics reporter - extract images from PDFs and image sources into DOCX+CSV')
+    parser = argparse.ArgumentParser(description='Example: python forensics_reporter.py --pdf sample.pdf --images images_dir --out report.docx')
     parser.add_argument('--pdf', type=str, default=None, help='Path to PDF file (use None to skip)')
     parser.add_argument('--images', type=str, default=None, help='Path to directory or ZIP with images (use None to skip)')
     parser.add_argument('--out', type=str, required=True, help='Output DOCX path')
