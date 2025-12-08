@@ -34,14 +34,14 @@ print(f'''
 |  .-'' '-' '|  |   \   --.|  ||  |.-'  `)|  |\ `--.    |  |   \   --.| '-' '' '-' '|  |     |  |  \   --.|  |    
 `--'   `---' `--'    `----'`--''--'`----' `--' `---'    `--'    `----'|  |-'  `---' `--'     `--'   `----'`--'    
                                                                       `--'                                        
-{YELLOW}|-------------------------------------------------{MAGENTA}coded by Mishima and Nocturnis){YELLOW}------------------------------------------------------------|{RESET}
+{YELLOW}|----------------------------------{MAGENTA}coded by Mishima and Nocturnis){YELLOW}---------------------------------------------|{RESET}
 {CYAN}[+] • DOCX + CSV output •{RESET}
 ''')
 
 # -------------------- Config --------------------
 SUPPORTED_EXT = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp'}
 MAX_EMBED_PIXELS = 2500 * 2500  # avoid embedding absurdly huge images
-EMBED_WIDTH_INCH = 2.8
+EMBED_WIDTH_INCH = 1
 CSV_ENCODING = 'utf-8-sig'
 CSV_QUOTE = csv.QUOTE_ALL
 EXIF_TAGS = {v: k for k, v in ExifTags.TAGS.items()}
@@ -386,24 +386,89 @@ def process_single_image_file(img_path: str, doc: Document, csv_path: str, seen_
     except Exception as e:
         logger.warning(f"Failed to process image {img_path}: {e}")
 
+def fast_file_hash(path: str, sample_size: int = 65536) -> str:
+    """Fast hash using first + last sample_size bytes + file size."""
+    stat = os.stat(path)
+    size = stat.st_size
+    h = hashlib.sha256()
+    h.update(str(size).encode())
+    with open(path, 'rb') as f:
+        if size <= sample_size * 2:
+            # Small file: hash entire content
+            h.update(f.read())
+        else:
+            # Large file: hash head + tail
+            h.update(f.read(sample_size))
+            f.seek(-sample_size, os.SEEK_END)
+            h.update(f.read(sample_size))
+    return h.hexdigest()
+
 def process_images_source(input_path: str, doc: Document, csv_path: str, seen_hashes: Set[str]):
     fs_warning = "(*'Created' may reflect inode change time on Linux.)"
+    image_paths = []
+
     if os.path.isdir(input_path):
         doc.add_heading('Source: Recovered Image Files (Directory)', level=1)
-        image_files = sorted([str(p) for p in Path(input_path).rglob('*') if p.suffix.lower() in SUPPORTED_EXT])
-        for img in image_files:
-            process_single_image_file(img, doc, csv_path, seen_hashes, fs_warning)
+        image_paths = sorted([str(p) for p in Path(input_path).rglob('*') if p.suffix.lower() in SUPPORTED_EXT])
     elif zipfile.is_zipfile(input_path):
         doc.add_heading('Source: Recovered Image Files (ZIP)', level=1)
         with tempfile.TemporaryDirectory() as tmp:
             with zipfile.ZipFile(input_path, 'r') as zf:
                 members = [m for m in zf.namelist() if Path(m).suffix.lower() in SUPPORTED_EXT and not m.endswith('/')]
                 extracted = safe_extract_zip(zf, tmp, members=members)
-                for full_path in extracted:
-                    source_label = f"{input_path} (member: {os.path.relpath(full_path, tmp)})"
-                    process_single_image_file(full_path, doc, csv_path, seen_hashes, fs_warning, source_label)
+                image_paths = extracted
+                # We'll add source labels later per file
     else:
         doc.add_paragraph(f"[!] Not valid dir/ZIP: {input_path}")
+        return
+
+    if not image_paths:
+        doc.add_paragraph("[!] No supported images found.")
+        return
+
+    # === DEDUPLICATION PASS ===
+    logger.info(f"Scanning {len(image_paths)} images for duplicates...")
+
+    # Group by fast hash to avoid full file reads
+    fast_hash_map = {}
+    for path in image_paths:
+        try:
+            fhash = fast_file_hash(path)
+            if fhash not in fast_hash_map:
+                fast_hash_map[fhash] = []
+            fast_hash_map[fhash].append(path)
+        except Exception as e:
+            logger.warning(f"Skipped {path} during fast hash: {e}")
+
+    total_original = len(image_paths)
+    kept_paths = []
+    for group in fast_hash_map.values():
+        if len(group) == 1:
+            kept_paths.append(group[0])
+        else:
+            # Resolve collisions with full SHA-256
+            resolved = {}
+            for p in group:
+                try:
+                    full_hash = sha256_file(p)
+                    if full_hash not in resolved:
+                        resolved[full_hash] = p
+                except Exception as e:
+                    logger.warning(f"Failed full hash on {p}: {e}")
+            kept_paths.extend(resolved.values())
+
+    duplicates_skipped = total_original - len(kept_paths)
+    if duplicates_skipped > 0:
+        logger.info(f"Skipped {duplicates_skipped} duplicate images.")
+
+    # === PROCESS ONLY UNIQUE IMAGES ===
+    for img_path in kept_paths:
+        source_label = ''
+        if zipfile.is_zipfile(input_path):
+            # Recover relative path inside ZIP
+            rel_path = os.path.relpath(img_path, os.path.dirname(img_path))  # crude; improve if needed
+            source_label = f"{input_path} (member: {rel_path})"
+        process_single_image_file(img_path, doc, csv_path, seen_hashes, fs_warning, source_label)
 
 # -------------------- Main --------------------
 def main(pdf_path: Optional[str], files_path: Optional[str], output_docx: str):
