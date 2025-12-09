@@ -46,6 +46,16 @@ CSV_ENCODING = 'utf-8-sig'
 CSV_QUOTE = csv.QUOTE_ALL
 EXIF_TAGS = {v: k for k, v in ExifTags.TAGS.items()}
 
+# -------------------- Sorting Helper --------------------
+def sort_paths_by_ext(paths):
+    """Sort paths: .png first, then .jpg/.jpeg, then others. Stable alphabetical within groups."""
+    ext_priority = {'.png': 0, '.jpg': 1, '.jpeg': 1}
+    def sort_key(p):
+        ext = Path(p).suffix.lower()
+        priority = ext_priority.get(ext, 999)
+        return (priority, str(p))
+    return sorted(paths, key=sort_key)
+
 # -------------------- Logging --------------------
 logger = logging.getLogger("forensics_reporter")
 handler = logging.StreamHandler()
@@ -152,10 +162,7 @@ def fix_orientation(img: Image.Image) -> Image.Image:
 def compress_image_bytes_for_docx(img_bytes: bytes, ext: str) -> bytes:
     try:
         with Image.open(io.BytesIO(img_bytes)) as img:
-            # EXIF Orientation fix
             img = fix_orientation(img)
-
-            # Resize big images
             w, h = img.size
             pixels = w * h
             if pixels > MAX_EMBED_PIXELS:
@@ -163,14 +170,10 @@ def compress_image_bytes_for_docx(img_bytes: bytes, ext: str) -> bytes:
                 new_w = max(100, int(w * scale))
                 new_h = max(100, int(h * scale))
                 img = img.resize((new_w, new_h), Image.LANCZOS)
-
-            # RGBA/LA → RGB conversion
             if img.mode in ("RGBA", "LA"):
                 bg = Image.new("RGB", img.size, (255, 255, 255))
                 bg.paste(img, mask=img.split()[-1])
                 img = bg
-
-            # JPEG compress
             bio = io.BytesIO()
             img.save(bio, format='JPEG', quality=75, optimize=True)
             return bio.getvalue()
@@ -178,13 +181,12 @@ def compress_image_bytes_for_docx(img_bytes: bytes, ext: str) -> bytes:
         logger.debug(f"compress_image_bytes_for_docx failed: {e}")
         return img_bytes
 
-
 # -------------------- DOCX helpers --------------------
 def style_doc(doc: Document):
     try:
         style = doc.styles['Normal']
         font = style.font
-        font.name = 'Consolas'
+        font.name = 'Consola'
         font.size = Pt(9)
     except Exception:
         pass
@@ -394,10 +396,8 @@ def fast_file_hash(path: str, sample_size: int = 65536) -> str:
     h.update(str(size).encode())
     with open(path, 'rb') as f:
         if size <= sample_size * 2:
-            # Small file: hash entire content
             h.update(f.read())
         else:
-            # Large file: hash head + tail
             h.update(f.read(sample_size))
             f.seek(-sample_size, os.SEEK_END)
             h.update(f.read(sample_size))
@@ -409,15 +409,15 @@ def process_images_source(input_path: str, doc: Document, csv_path: str, seen_ha
 
     if os.path.isdir(input_path):
         doc.add_heading('Source: Recovered Image Files (Directory)', level=1)
-        image_paths = sorted([str(p) for p in Path(input_path).rglob('*') if p.suffix.lower() in SUPPORTED_EXT])
+        image_paths = [str(p) for p in Path(input_path).rglob('*') if p.suffix.lower() in SUPPORTED_EXT]
+        image_paths = sort_paths_by_ext(image_paths)
     elif zipfile.is_zipfile(input_path):
         doc.add_heading('Source: Recovered Image Files (ZIP)', level=1)
         with tempfile.TemporaryDirectory() as tmp:
             with zipfile.ZipFile(input_path, 'r') as zf:
                 members = [m for m in zf.namelist() if Path(m).suffix.lower() in SUPPORTED_EXT and not m.endswith('/')]
                 extracted = safe_extract_zip(zf, tmp, members=members)
-                image_paths = extracted
-                # We'll add source labels later per file
+                image_paths = sort_paths_by_ext(extracted)
     else:
         doc.add_paragraph(f"[!] Not valid dir/ZIP: {input_path}")
         return
@@ -429,7 +429,6 @@ def process_images_source(input_path: str, doc: Document, csv_path: str, seen_ha
     # === DEDUPLICATION PASS ===
     logger.info(f"Scanning {len(image_paths)} images for duplicates...")
 
-    # Group by fast hash to avoid full file reads
     fast_hash_map = {}
     for path in image_paths:
         try:
@@ -446,7 +445,6 @@ def process_images_source(input_path: str, doc: Document, csv_path: str, seen_ha
         if len(group) == 1:
             kept_paths.append(group[0])
         else:
-            # Resolve collisions with full SHA-256
             resolved = {}
             for p in group:
                 try:
@@ -461,13 +459,15 @@ def process_images_source(input_path: str, doc: Document, csv_path: str, seen_ha
     if duplicates_skipped > 0:
         logger.info(f"Skipped {duplicates_skipped} duplicate images.")
 
+    # === SORT UNIQUE IMAGES BEFORE PROCESSING ===
+    kept_paths = sort_paths_by_ext(kept_paths)
+
     # === PROCESS ONLY UNIQUE IMAGES ===
     for img_path in kept_paths:
         source_label = ''
         if zipfile.is_zipfile(input_path):
-            # Recover relative path inside ZIP
-            rel_path = os.path.relpath(img_path, os.path.dirname(img_path))  # crude; improve if needed
-            source_label = f"{input_path} (member: {rel_path})"
+            arcname = os.path.relpath(img_path, os.path.commonpath([img_path, tmp]))
+            source_label = f"{input_path} (member: {arcname})"
         process_single_image_file(img_path, doc, csv_path, seen_hashes, fs_warning, source_label)
 
 # -------------------- Main --------------------
