@@ -24,8 +24,9 @@ YELLOW = "\033[93m"
 MAGENTA = "\033[95m"
 CYAN = "\033[96m"
 RESET = "\033[0m"
+GREEN = "\033[92m"
 
-print(f'''
+print(fr'''
 {RED}      
                                                                                                                   
  ,---.                                    ,--.                                               ,--.                 
@@ -35,7 +36,7 @@ print(f'''
 `--'   `---' `--'    `----'`--''--'`----' `--' `---'    `--'    `----'|  |-'  `---' `--'     `--'   `----'`--'    
                                                                       `--'                                        
 {YELLOW}|----------------------------------{MAGENTA}coded by Mishima and Nocturnis){YELLOW}---------------------------------------------|{RESET}
-{CYAN}[+] • DOCX + CSV output •{RESET}
+{CYAN}[+] • DOCX + CSV output •{GREEN}
 ''')
 
 # -------------------- Config --------------------
