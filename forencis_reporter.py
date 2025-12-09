@@ -20,11 +20,11 @@ from PIL import Image, ExifTags
 
 # ANSI colors
 RED = "\033[91m"
+GREEN = "\033[92m"
 YELLOW = "\033[93m"
 MAGENTA = "\033[95m"
 CYAN = "\033[96m"
 RESET = "\033[0m"
-GREEN = "\033[92m"
 
 print(fr'''
 {RED}      
